@@ -47,6 +47,14 @@ OUTPUT_DIR = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
 SEED = 20261112
 N_SIMS = 6000
 
+# Tunable via env (v4 grid search; defaults = v4 tuned values, validated on
+# rolling-origin backtests vs v3: practice-like log -38.73 -> ~-36.0).
+MIN_P = float(os.environ.get("MAKEFUN_MIN_P", "0.002"))  # smallest prob row written
+SHARPEN_ALPHA = float(os.environ.get("MAKEFUN_SHARPEN", "2.0"))  # per-place p^alpha renormalised
+SIZE_SD_CAP = float(os.environ.get("MAKEFUN_SIZE_SD_CAP", "0.35"))
+SIZE_SD_FLOOR = float(os.environ.get("MAKEFUN_SIZE_SD_FLOOR", "0.15"))
+SIZE_SHIFT = float(os.environ.get("MAKEFUN_SIZE_SHIFT", "0.15"))  # v4: MC size means run ~+0.25 dex high
+
 # ---- model constants (priors; the history re-estimates what it can) ----
 # Practice lesson: pump.fun runners peak within ~30-60 min and then fade
 # fast (4 of the 5 top coins at the 20:50 cut were gone by the 22:00 read,
@@ -67,7 +75,6 @@ NEWCOMER_MU = 3.15    # log10 SOL of a fresh runner at its peak
 NEWCOMER_SD = 0.35
 NEWCOMER_N = 6        # fresh-runner candidates simulated per read
 TAIL_MASS = 0.04      # per place: long-tail chart coins we do not model
-MIN_P = 0.002         # smallest probability row we write
 MAX_ROWS_PER_PLACE = 100  # HARD LIMIT (grader/forecast/ranked.ts parseRanked):
                           # a place with MORE than 100 probability rows is
                           # not a forecast at all -- the whole file scores
@@ -322,6 +329,16 @@ def main():
             if p >= MIN_P:
                 rows.append({"mint": mint, "place": k + 1, "p": p})
                 named += p
+        # v4: sharpen -- p^alpha renormalised to the same named sum.
+        # Long-horizon backtests show the winners are usually among the top
+        # candidates; concentrating on them gains order score. alpha=1 is v3.
+        if SHARPEN_ALPHA != 1.0 and rows:
+            w = [r["p"] ** SHARPEN_ALPHA for r in rows]
+            tw = sum(w)
+            if tw > 0:
+                for r, wi in zip(rows, w):
+                    r["p"] = floor6(named * wi / tw)
+                rows = [r for r in rows if r["p"] > 0]
         # unnamed mass = newcomers + tail + the sub-threshold named mass.
         # (Anything not named is shared by the scorer over the chart's
         # unnamed coins, which is exactly the newcomer/tail treatment.)
@@ -368,9 +385,10 @@ def main():
             else:
                 cen = (edges[b - 1] + edges[b]) / 2.0
             centres.append((cen, c))
-        mean = sum(c * n for c, n in centres) / tot
-        var = sum(n * (c - mean) ** 2 for c, n in centres) / tot
-        sd = max(0.15, min(0.35, math.sqrt(var)))
+        mean_raw = sum(c * n for c, n in centres) / tot
+        var = sum(n * (c - mean_raw) ** 2 for c, n in centres) / tot
+        mean = mean_raw - SIZE_SHIFT  # v4: MC size means run ~+0.25 dex high
+        sd = max(SIZE_SD_FLOOR, min(SIZE_SD_CAP, math.sqrt(var)))
         for b in range(len(edges) + 1):
             lo = float("-inf") if b == 0 else edges[b - 1]
             hi = float("inf") if b == len(edges) else edges[b]
