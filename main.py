@@ -68,6 +68,12 @@ NEWCOMER_SD = 0.35
 NEWCOMER_N = 6        # fresh-runner candidates simulated per read
 TAIL_MASS = 0.04      # per place: long-tail chart coins we do not model
 MIN_P = 0.002         # smallest probability row we write
+MAX_ROWS_PER_PLACE = 100  # HARD LIMIT (grader/forecast/ranked.ts parseRanked):
+                          # a place with MORE than 100 probability rows is
+                          # not a forecast at all -- the whole file scores
+                          # the floor at every place and size (-92.1). v2
+                          # wrote 150/171/175 rows at places 3/4/5 and was
+                          # scored exactly that. Never exceed this.
 
 
 def parse_time(s):
@@ -308,7 +314,10 @@ def main():
     for k in range(places):
         named = 0.0
         rows = []
-        for mint, cnt in sorted(place_counts[k].items(), key=lambda kv: -kv[1]):
+        # Top MAX_ROWS_PER_PLACE by p only: the rows dropped return their
+        # mass to the place's unnamed share (shared by the chart's unnamed
+        # coins, i.e. newcomers) -- honest and proper.
+        for mint, cnt in sorted(place_counts[k].items(), key=lambda kv: -kv[1])[:MAX_ROWS_PER_PLACE]:
             p = floor6(cnt / total)
             if p >= MIN_P:
                 rows.append({"mint": mint, "place": k + 1, "p": p})
@@ -370,6 +379,25 @@ def main():
                 sizes.append({"place": k + 1, "bin": b, "p": p})
 
     forecast = {"probabilities": probabilities, "top5": top5, "sizes": sizes}
+
+    # ---- self-validation (mirrors grader/forecast/ranked.ts parseRanked) ----
+    # An invalid forecast scores the floor everywhere (-92.1). Fail loudly
+    # instead of writing one.
+    assert set(forecast.keys()) == {"probabilities", "top5", "sizes"}
+    assert len(top5) == places and len(set(top5)) == places
+    for k in range(places):
+        pr = [r for r in probabilities if r["place"] == k + 1]
+        assert len(pr) <= MAX_ROWS_PER_PLACE, f"place {k+1} has {len(pr)} rows"
+        assert len({r["mint"] for r in pr}) == len(pr)
+        assert all(set(r.keys()) == {"mint", "place", "p"} and 0 <= r["p"] <= 1 for r in pr)
+        assert sum(r["p"] for r in pr) <= 1 + 1e-9
+        sr = [r for r in sizes if r["place"] == k + 1]
+        assert len({r["bin"] for r in sr}) == len(sr)
+        assert all(set(r.keys()) == {"place", "bin", "p"} and 0 <= r["bin"] <= len(edges) and 0 <= r["p"] <= 1 for r in sr)
+        assert sum(r["p"] for r in sr) <= 1 + 1e-9
+    blob = (json.dumps(forecast) + "\n").encode()
+    assert len(blob) <= 1_048_576, f"forecast {len(blob)} bytes over 1 MiB"
+
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     with open(os.path.join(OUTPUT_DIR, task.get("output", "forecast.json")), "w") as f:
         f.write(json.dumps(forecast) + "\n")
