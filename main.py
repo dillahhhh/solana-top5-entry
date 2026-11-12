@@ -56,6 +56,22 @@ SHARPEN_ALPHA = float(os.environ.get("MAKEFUN_SHARPEN", "1.5"))  # per-place p^a
 SIZE_SD_CAP = float(os.environ.get("MAKEFUN_SIZE_SD_CAP", "0.35"))
 SIZE_SD_FLOOR = float(os.environ.get("MAKEFUN_SIZE_SD_FLOOR", "0.15"))
 SIZE_SHIFT = float(os.environ.get("MAKEFUN_SIZE_SHIFT", "0.08"))  # v5: MC size means run ~+0.25 dex high
+# v6: persistence blend. The v6 "oracle ceiling" (-34.79) was computed on
+# cuts at 20:10/20:20 -- the EXTREME-CHURN regime (top-5 overlap 1/5 per
+# 10 min). The real practice cut (21:00, 60 min of history) sits in the
+# LATE-STABLE regime (20:30-20:50: overlap 4/5, survivors GROW +0.05..0.19
+# dex/10min). The MC's age prior (drift -0.32/h, death 0.45/h for <1h coins)
+# is exactly backwards there, and its wide size distributions waste the
+# size score (sticky sd 0.10 beat MC -8.66 vs -12.24 at a 10-min horizon).
+# Blend the MC forecast toward the sticky (last-chart) forecast with a
+# weight that decays with mean horizon: practice (mean h ~0.5h) is sticky,
+# final (mean h ~10h) stays MC. Log score is concave, so the blend scores
+# at least the average of its parts.
+PERSIST_TAU = float(os.environ.get("MAKEFUN_PERSIST_TAU", "0.001"))   # order blend tau (hours); v6: OFF (validated: order blend gains read 0 (+5) but loses more at later reads; net <= 0 over 7 reads)
+STICKY_TAU = float(os.environ.get("MAKEFUN_STICKY_TAU", "1.5"))     # size blend tau (hours)
+STICKY_SD = float(os.environ.get("MAKEFUN_STICKY_SD", "0.12"))      # sticky size sd (dex)
+STICKY_SELF = float(os.environ.get("MAKEFUN_STICKY_SELF", "0.55"))  # sticky mass on same place
+STICKY_NBR = float(os.environ.get("MAKEFUN_STICKY_NBR", "0.10"))    # sticky mass on +-1 place
 
 # ---- model constants (priors; the history re-estimates what it can) ----
 # Practice lesson: pump.fun runners peak within ~30-60 min and then fade
@@ -129,6 +145,9 @@ def main():
     reads = [parse_time(r) for r in task["reads"]]
     horizons = [(r - cut) / 3600.0 for r in reads]  # hours after the cut
     horizon_max = max(horizons)
+    h_mean = sum(horizons) / len(horizons)
+    w_persist = math.exp(-h_mean / PERSIST_TAU)  # practice ~0.61, final ~0.0
+    w_size = math.exp(-h_mean / STICKY_TAU)      # practice ~0.72, final ~0.0
 
     marks = []
     with open(os.path.join(INPUT_DIR, "history.ndjson")) as f:
@@ -163,6 +182,18 @@ def main():
     last_mark = marks[-1]
     last_rows = sorted(last_mark["rows"], key=lambda r: r["rank"])
     last_at = (parse_time(last_mark["at"]) - t0) / 3600.0
+    last_caps = [log_cap_sol(r["market_cap_lamports"]) for r in last_rows[:places]]
+    # top-5 cap trend (dex/hour) from the last two marks: survivors in the
+    # late regime grow; clip to [0, 0.8] (never extrapolate a dump).
+    growth_h = 0.0
+    if len(marks) >= 2:
+        prev_by = {r["mint"]: log_cap_sol(r["market_cap_lamports"])
+                   for r in sorted(marks[-2]["rows"], key=lambda r: r["rank"])[:places]}
+        incs = sorted(log_cap_sol(r["market_cap_lamports"]) - prev_by[r["mint"]]
+                      for r in last_rows[:places] if r["mint"] in prev_by)
+        if incs:
+            dt_h = max((parse_time(last_mark["at"]) - parse_time(marks[-2]["at"])) / 3600.0, 1e-9)
+            growth_h = max(0.0, min(0.8, incs[len(incs) // 2] / dt_h))
 
     # ---- fit the young-runner peak distribution from the history ----
     # A coin's peak log-cap and its age at peak; runners peak young.
@@ -331,6 +362,24 @@ def main():
             if p >= MIN_P:
                 rows.append({"mint": mint, "place": k + 1, "p": p})
                 named += p
+        # v6: blend toward the sticky (last-chart) forecast. Same-place mass
+        # STICKY_SELF, +-1 place STICKY_NBR; weight decays with horizon.
+        if w_persist > 0.01:
+            st = {}
+            for kk, r in enumerate(last_rows[:places], 1):
+                if kk == k + 1:
+                    st[r["mint"]] = STICKY_SELF
+                elif abs(kk - (k + 1)) == 1:
+                    st[r["mint"]] = STICKY_NBR
+            merged = {}
+            for r in rows:
+                merged[r["mint"]] = (1.0 - w_persist) * r["p"]
+            for mint, sp in st.items():
+                merged[mint] = merged.get(mint, 0.0) + w_persist * sp
+            rows = [{"mint": m, "place": k + 1, "p": floor6(p)}
+                    for m, p in merged.items() if floor6(p) >= MIN_P]
+            rows.sort(key=lambda r: -r["p"])
+            rows = rows[:MAX_ROWS_PER_PLACE]
         # v4: sharpen -- p^alpha renormalised to the same named sum.
         # Long-horizon backtests show the winners are usually among the top
         # candidates; concentrating on them gains order score. alpha=1 is v3.
@@ -363,6 +412,9 @@ def main():
                     break
         top5.append(best)
         used.add(best)
+    # v6: short horizons -> the tie-break top5 is the last chart's order.
+    if w_persist > 0.3:
+        top5 = [r["mint"] for r in last_rows[:places]]
 
     # Sizes v2: fit a normal (in log10 SOL) to the simulated caps at each
     # place, sd floored at 0.15 and capped at 0.35. The raw histogram is
@@ -391,10 +443,15 @@ def main():
         var = sum(n * (c - mean_raw) ** 2 for c, n in centres) / tot
         mean = mean_raw - SIZE_SHIFT  # v4: MC size means run ~+0.25 dex high
         sd = max(SIZE_SD_FLOOR, min(SIZE_SD_CAP, math.sqrt(var)))
+        # v6: blend the MC size normal toward a tight sticky normal centred
+        # on the last cap at this place + trend growth over the mean horizon.
+        mean_sticky = last_caps[k] + growth_h * h_mean
         for b in range(len(edges) + 1):
             lo = float("-inf") if b == 0 else edges[b - 1]
             hi = float("inf") if b == len(edges) else edges[b]
-            p = floor6(norm_cdf(hi, mean, sd) - norm_cdf(lo, mean, sd))
+            p_mc = norm_cdf(hi, mean, sd) - norm_cdf(lo, mean, sd)
+            p_st = norm_cdf(hi, mean_sticky, STICKY_SD) - norm_cdf(lo, mean_sticky, STICKY_SD)
+            p = floor6((1.0 - w_size) * p_mc + w_size * p_st)
             if p > 0:
                 sizes.append({"place": k + 1, "bin": b, "p": p})
 
