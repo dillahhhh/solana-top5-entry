@@ -47,13 +47,15 @@ OUTPUT_DIR = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
 SEED = 20261112
 N_SIMS = 6000
 
-# Tunable via env (v4 grid search; defaults = v4 tuned values, validated on
-# rolling-origin backtests vs v3: practice-like log -38.73 -> ~-36.0).
+# Tunable via env (v5 grid search; defaults = v5 tuned values. v4's
+# shift 0.15 + sharpen 2.0 scored WORSE on the real practice window
+# (-37.3) than v3 (-36.6): it overshot. Grid on practice-like cuts:
+# shift 0.08 + sharpen 1.5 = -36.87 (best), vs v3 base -38.73.
 MIN_P = float(os.environ.get("MAKEFUN_MIN_P", "0.002"))  # smallest prob row written
-SHARPEN_ALPHA = float(os.environ.get("MAKEFUN_SHARPEN", "2.0"))  # per-place p^alpha renormalised
+SHARPEN_ALPHA = float(os.environ.get("MAKEFUN_SHARPEN", "1.5"))  # per-place p^alpha renormalised
 SIZE_SD_CAP = float(os.environ.get("MAKEFUN_SIZE_SD_CAP", "0.35"))
 SIZE_SD_FLOOR = float(os.environ.get("MAKEFUN_SIZE_SD_FLOOR", "0.15"))
-SIZE_SHIFT = float(os.environ.get("MAKEFUN_SIZE_SHIFT", "0.15"))  # v4: MC size means run ~+0.25 dex high
+SIZE_SHIFT = float(os.environ.get("MAKEFUN_SIZE_SHIFT", "0.08"))  # v5: MC size means run ~+0.25 dex high
 
 # ---- model constants (priors; the history re-estimates what it can) ----
 # Practice lesson: pump.fun runners peak within ~30-60 min and then fade
