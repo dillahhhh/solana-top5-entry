@@ -78,6 +78,15 @@ def log_cap_sol(market_cap_lamports):
     return math.log10(int(market_cap_lamports)) - 9.0
 
 
+def norm_cdf(x, mean, sd):
+    """P(X <= x) for X normal(mean, sd); x may be +/-inf."""
+    if x == float("-inf"):
+        return 0.0
+    if x == float("inf"):
+        return 1.0
+    return 0.5 * (1.0 + math.erf((x - mean) / (sd * math.sqrt(2.0))))
+
+
 def bin_of(logcap, edges):
     """Size bin 0..81 for log10(cap in SOL); edges are 2.00..6.00 at 0.05."""
     if logcap < edges[0]:
@@ -327,10 +336,36 @@ def main():
         top5.append(best)
         used.add(best)
 
+    # Sizes v2: fit a normal (in log10 SOL) to the simulated caps at each
+    # place, sd floored at 0.15 and capped at 0.35. The raw histogram is
+    # diffuse/bimodal (decayed survivors + newcomers); a tight unimodal
+    # distribution around the simulated level scores better: the place
+    # sizes are roughly stationary (new runners replenish the top) even
+    # as the coins churn.
     sizes = []
     for k in range(places):
+        tot = sum(size_counts[k])
+        if tot == 0:
+            continue
+        centres = []
         for b in range(len(edges) + 1):
-            p = floor6(size_counts[k][b] / total)
+            c = size_counts[k][b]
+            if c == 0:
+                continue
+            if b == 0:
+                cen = edges[0] - 0.025
+            elif b == len(edges):
+                cen = edges[-1] + 0.025
+            else:
+                cen = (edges[b - 1] + edges[b]) / 2.0
+            centres.append((cen, c))
+        mean = sum(c * n for c, n in centres) / tot
+        var = sum(n * (c - mean) ** 2 for c, n in centres) / tot
+        sd = max(0.15, min(0.35, math.sqrt(var)))
+        for b in range(len(edges) + 1):
+            lo = float("-inf") if b == 0 else edges[b - 1]
+            hi = float("inf") if b == len(edges) else edges[b]
+            p = floor6(norm_cdf(hi, mean, sd) - norm_cdf(lo, mean, sd))
             if p > 0:
                 sizes.append({"place": k + 1, "bin": b, "p": p})
 
